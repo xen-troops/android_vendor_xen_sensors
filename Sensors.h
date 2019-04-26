@@ -1,5 +1,6 @@
 /*
  * Copyright (C) 2016 The Android Open Source Project
+ * Copyright (C) 2019 EPAM systems
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,24 +15,44 @@
  * limitations under the License.
  */
 
-#ifndef HARDWARE_INTERFACES_SENSORS_V1_0_DEFAULT_SENSORS_H_
+#ifndef SENSORS_H_
 
-#define HARDWARE_INTERFACES_SENSORS_V1_0_DEFAULT_SENSORS_H_
+#define SENSORS_H_
 
 #include <android-base/macros.h>
 #include <android/hardware/sensors/1.0/ISensors.h>
 #include <hardware/sensors.h>
+#include <map>
 #include <mutex>
+#include <queue>
+#include <string>
+#include <vector>
+
+#include "RecurrentTimer.h"
+#include "VisClient.h"
 
 namespace android {
 namespace hardware {
 namespace sensors {
 namespace V1_0 {
-namespace implementation {
+namespace xenvm {
 
+using android::hardware::sensors::V1_0::OperationMode;
+using android::hardware::sensors::V1_0::SensorType;
+using epam::VisClient;
+
+struct ExtendedSensorInfo {
+    SensorInfo si;
+    std::string visPropertyName;
+    bool enabled;
+    int64_t samplingPeriodNs;
+    int64_t maxReportLatencyNs;
+    EventPayload eventPayload;
+};
 
 struct Sensors : public ::android::hardware::sensors::V1_0::ISensors {
     Sensors();
+    ~Sensors();
 
     status_t initCheck() const;
 
@@ -62,27 +83,56 @@ struct Sensors : public ::android::hardware::sensors::V1_0::ISensors {
             int32_t sensorHandle, int32_t channelHandle, RateLevel rate,
             configDirectReport_cb _hidl_cb) override;
 
-private:
+ private:
     static constexpr int32_t kPollMaxBufferSize = 128;
     status_t mInitCheck;
-    sensors_module_t *mSensorModule;
-    sensors_poll_device_1_t *mSensorDevice;
     std::mutex mPollLock;
+    std::queue<Event> mEventQueue;
+    std::vector<ExtendedSensorInfo> mSensorList;
+    std::map<std::string, int32_t> mVisToSensorHandle;
+    std::map<int32_t, std::string> sensorHandleToVis;
+    OperationMode mOperationMode;
+    std::mutex mLock;
+    RecurrentTimer mRecurrentTimer;
 
-    int getHalDeviceVersion() const;
+    VisClient mVisClient;
+    bool mVisConnceted;
+    std::future<void> mConnectionFuture;
+    uint32_t mActiveSensors;
+    uint32_t mMainSubscriptionId;
+    bool mSubscribed;
 
-    static void convertFromSensorEvents(
-            size_t count, const sensors_event_t *src, hidl_vec<Event> *dst);
+    void onContinuousPropertyTimer(const std::vector<int32_t>& properties);
+    Event createFakeEvent(int32_t sensor_handle);
+
+    static void convertFromSensorEvents(size_t count, const sensors_event_t* src,
+                                        hidl_vec<Event>* dst);
+    bool isOneShotSensor(SensorType sType) const;
+    bool isContiniousSensor(SensorType sType) const;
+    bool isOnChangeSensor(SensorType sType) const;
+
+    bool isRecurrentEventNeeded(SensorType sType) const {
+        if (isContiniousSensor(sType) || isOnChangeSensor(sType)) return true;
+        return false;
+    }
+    void insertEventUnlocked(Event& ev);
+    void subscribeToAll();
+    void subscriptionHandler(const epam::CommandResult& result);
+    void onVisConnectionStatusUpdate(bool connected);
+    void handleConnectionAsync(bool connected);
+    bool convertJsonToSensorPayload(int32_t sensorHandle, Json::Value& val);
+
+    static const int kMaxEventQueueSize = 10000;
 
     DISALLOW_COPY_AND_ASSIGN(Sensors);
 };
 
-extern "C" ISensors *HIDL_FETCH_ISensors(const char *name);
+extern "C" ISensors* HIDL_FETCH_ISensors(const char* name);
 
-}  // namespace implementation
+}  // namespace xenvm
 }  // namespace V1_0
 }  // namespace sensors
 }  // namespace hardware
 }  // namespace android
 
-#endif  // HARDWARE_INTERFACES_SENSORS_V1_0_DEFAULT_SENSORS_H_
+#endif  // SENSORS_H_

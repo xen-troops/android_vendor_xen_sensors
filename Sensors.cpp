@@ -1,5 +1,6 @@
 /*
  * Copyright (C) 2016 The Android Open Source Project
+ * Copyright (C) 2019 EPAM systems
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,335 +15,662 @@
  * limitations under the License.
  */
 
+// #define LOG_NDEBUG 0
+// #define GENERATE_FAKE_EVENTS
+#define LOG_TAG "sensors@1.0-xenvm"
+
 #include "Sensors.h"
-#include "convert.h"
-#include "multihal.h"
+#include "SensorsFactory.h"
 
-#include <android-base/logging.h>
-
+#include <log/log.h>
 #include <sys/stat.h>
+#include <utils/SystemClock.h>
 
 namespace android {
 namespace hardware {
 namespace sensors {
 namespace V1_0 {
-namespace implementation {
+namespace xenvm {
 
-/*
- * If a multi-hal configuration file exists in the proper location,
- * return true indicating we need to use multi-hal functionality.
- */
-static bool UseMultiHal() {
-    const std::string& name = MULTI_HAL_CONFIG_FILE_PATH;
-    struct stat buffer;
-    return (stat (name.c_str(), &buffer) == 0);
-}
+/* VIS related */
 
-static Result ResultFromStatus(status_t err) {
-    switch (err) {
-        case OK:
-            return Result::OK;
-        case PERMISSION_DENIED:
-            return Result::PERMISSION_DENIED;
-        case NO_MEMORY:
-            return Result::NO_MEMORY;
-        case BAD_VALUE:
-            return Result::BAD_VALUE;
-        default:
-            return Result::INVALID_OPERATION;
+// TODO(Andrii): Add subscribeExisting
+void Sensors::subscribeToAll() {
+    // Subscribe to all
+    ALOGV("Will try to subscribe to all VIS properties");
+    epam::WMessageResult result;
+    std::function<void(const epam::CommandResult&)> resultHandler =
+        std::bind(&Sensors::subscriptionHandler, this, std::placeholders::_1);
+    epam::Status st = mVisClient.subscribePropertySync(VisClient::kAllTag, resultHandler, result);
+
+    if (st == epam::Status::OK) {
+        mMainSubscriptionId = result.subscriptionId;
+        ALOGI("Subscribed with id =%zu", result.subscriptionId);
+        mSubscribed = true;
     }
 }
+
+void Sensors::subscriptionHandler(const epam::CommandResult& result) {
+    ALOGV("Sensors::subscriptionHandler");
+    for (auto r : result) {
+        ALOGV("Sensors::subscriptionHandler processing {%s}", r.first.c_str());
+        auto sit = mVisToSensorHandle.find(r.first);
+        if (sit != mVisToSensorHandle.end()) {
+            ALOGV("Found updated property [%s] for sensor handle = %d", r.first.c_str(),
+                  sit->second);
+            if (convertJsonToSensorPayload(sit->second, r.second)) {
+                if (!isContiniousSensor(mSensorList[sit->second].si.type)) {
+                    std::lock_guard<std::mutex> lock(mPollLock);
+                    Event ev = {
+                        .sensorHandle = sit->second,
+                        .sensorType =
+                            reinterpret_cast<SensorType>(mSensorList[sit->second].si.type),
+                        .timestamp = elapsedRealtimeNano(),
+                        .u = mSensorList[sit->second].eventPayload,
+                    };
+                    insertEventUnlocked(ev);
+                }
+            }
+        }
+    }
+}
+
+bool Sensors::convertJsonToSensorPayload(int32_t sensorHandle, Json::Value& jval) {
+    switch ((SensorType)mSensorList[sensorHandle].si.type) {
+        case SensorType::ACCELEROMETER:
+        case SensorType::MAGNETIC_FIELD:
+        case SensorType::ORIENTATION:
+        case SensorType::GYROSCOPE:
+        case SensorType::GRAVITY:
+        case SensorType::LINEAR_ACCELERATION: {
+            for (int i = 0; i < 3; i++) {
+                if (!jval[i].isConvertibleTo(Json::realValue)) {
+                    ALOGE("Can't convert from JSON to float data for sensor handle %d",
+                          sensorHandle);
+                    return false;
+                }
+            }
+            if (!jval[3].isConvertibleTo(Json::intValue)) {
+                ALOGE("Can't convert from JSON to sensor status for sensor handle %d",
+                      sensorHandle);
+                return false;
+            }
+            mSensorList[sensorHandle].eventPayload.vec3.x = jval[0].asFloat();
+            mSensorList[sensorHandle].eventPayload.vec3.y = jval[1].asFloat();
+            mSensorList[sensorHandle].eventPayload.vec3.z = jval[2].asFloat();
+            int status = jval[3].asInt();
+            mSensorList[sensorHandle].eventPayload.vec3.status =
+                (status > static_cast<int>(SensorStatus::ACCURACY_HIGH) ||
+                 status < static_cast<int>(SensorStatus::NO_CONTACT))
+                    ? SensorStatus::UNRELIABLE
+                    : static_cast<SensorStatus>(status);
+            return true;
+        }
+        case SensorType::GAME_ROTATION_VECTOR: {
+            for (int i = 0; i < 4; i++) {
+                if (!jval[i].isConvertibleTo(Json::realValue)) {
+                    ALOGE("Can't convert from JSON to float data for sensor handle %d",
+                          sensorHandle);
+                    return false;
+                }
+            }
+            mSensorList[sensorHandle].eventPayload.vec4.x = jval[0].asFloat();
+            mSensorList[sensorHandle].eventPayload.vec4.y = jval[1].asFloat();
+            mSensorList[sensorHandle].eventPayload.vec4.z = jval[2].asFloat();
+            mSensorList[sensorHandle].eventPayload.vec4.w = jval[3].asFloat();
+            return true;
+        }
+        case SensorType::ROTATION_VECTOR:
+        case SensorType::GEOMAGNETIC_ROTATION_VECTOR: {
+            for (int i = 0; i < 5; i++) {
+                if (!jval[i].isConvertibleTo(Json::realValue)) {
+                    ALOGE("Can't convert from JSON to float data for sensor handle %d",
+                          sensorHandle);
+                    return false;
+                }
+                mSensorList[sensorHandle].eventPayload.data[i] = jval[i].asFloat();
+            }
+            return true;
+        }
+        case SensorType::MAGNETIC_FIELD_UNCALIBRATED:
+        case SensorType::GYROSCOPE_UNCALIBRATED:
+        case SensorType::ACCELEROMETER_UNCALIBRATED: {
+            for (int i = 0; i < 6; i++) {
+                if (!jval[i].isConvertibleTo(Json::realValue)) {
+                    ALOGE("Can't convert from JSON to float data for sensor handle %d",
+                          sensorHandle);
+                    return false;
+                }
+                mSensorList[sensorHandle].eventPayload.data[i] = jval[i].asFloat();
+            }
+            mSensorList[sensorHandle].eventPayload.uncal.x = jval[0].asFloat();
+            mSensorList[sensorHandle].eventPayload.uncal.y = jval[1].asFloat();
+            mSensorList[sensorHandle].eventPayload.uncal.z = jval[2].asFloat();
+            mSensorList[sensorHandle].eventPayload.uncal.x_bias = jval[3].asFloat();
+            mSensorList[sensorHandle].eventPayload.uncal.y_bias = jval[4].asFloat();
+            mSensorList[sensorHandle].eventPayload.uncal.z_bias = jval[5].asFloat();
+            return true;
+        }
+        case SensorType::DEVICE_ORIENTATION:
+        case SensorType::LIGHT:
+        case SensorType::PRESSURE:
+        case SensorType::TEMPERATURE:
+        case SensorType::PROXIMITY:
+        case SensorType::RELATIVE_HUMIDITY:
+        case SensorType::AMBIENT_TEMPERATURE:
+        case SensorType::SIGNIFICANT_MOTION:
+        case SensorType::STEP_DETECTOR:
+        case SensorType::TILT_DETECTOR:
+        case SensorType::WAKE_GESTURE:
+        case SensorType::GLANCE_GESTURE:
+        case SensorType::PICK_UP_GESTURE:
+        case SensorType::WRIST_TILT_GESTURE:
+        case SensorType::STATIONARY_DETECT:
+        case SensorType::MOTION_DETECT:
+        case SensorType::HEART_BEAT:
+        case SensorType::LOW_LATENCY_OFFBODY_DETECT: {
+            if (!jval.isConvertibleTo(Json::realValue)) {
+                ALOGE("Can't convert from JSON to float data for sensor handle %d", sensorHandle);
+                return false;
+            }
+            mSensorList[sensorHandle].eventPayload.scalar = jval.asFloat();
+            return true;
+        }
+        case SensorType::STEP_COUNTER: {
+            if (!jval.isUInt64()) {
+                ALOGE("Can't convert from JSON to isUInt64 data for sensor handle %d",
+                      sensorHandle);
+                return false;
+            }
+            mSensorList[sensorHandle].eventPayload.stepCount = jval.isUInt64();
+            return true;
+        }
+        case SensorType::HEART_RATE: {
+            if (!jval[0].isConvertibleTo(Json::realValue)) {
+                ALOGE("Can't convert from JSON to float data for sensor handle %d", sensorHandle);
+                return false;
+            }
+            if (!jval[1].isConvertibleTo(Json::intValue)) {
+                ALOGE("Can't convert from JSON to sensor status for sensor handle %d",
+                      sensorHandle);
+                return false;
+            }
+            mSensorList[sensorHandle].eventPayload.heartRate.bpm = jval[0].asFloat();
+            int status = jval[1].asInt();
+            mSensorList[sensorHandle].eventPayload.heartRate.status =
+                (status > static_cast<int>(SensorStatus::ACCURACY_HIGH) ||
+                 status < static_cast<int>(SensorStatus::NO_CONTACT))
+                    ? SensorStatus::UNRELIABLE
+                    : static_cast<SensorStatus>(status);
+            return true;
+        }
+        case SensorType::POSE_6DOF: {  // 15 floats
+            for (int i = 0; i < 15; ++i) {
+                if (!jval[i].isConvertibleTo(Json::realValue)) {
+                    ALOGE("Can't convert from JSON to float data for sensor handle %d",
+                          sensorHandle);
+                    return false;
+                }
+                mSensorList[sensorHandle].eventPayload.pose6DOF[i] = jval[i].asFloat();
+            }
+            return true;
+        }
+        default:
+            ALOGE("Can't convert, unknown sensor type for handle %d", sensorHandle);
+            return false;
+    }
+    return false;
+}
+
+void Sensors::handleConnectionAsync(bool connected) {
+    std::lock_guard<std::mutex> lock(mLock);
+    ALOGI("Received connection state update to %d from VisClient", connected);
+    mVisConnceted = connected;
+    if (mVisConnceted) {
+        ALOGI("Connected to VIS...");
+        epam::WMessageResult sr;
+        epam::Status st = mVisClient.getPropertySync(VisClient::kAllTag, sr);
+        if (st != epam::Status::OK) {
+            ALOGE("Unable to get * from VIS");
+            return;
+        }
+        ALOGV("Get * from VIS.");
+        subscriptionHandler(sr.commandResult);
+        subscribeToAll();
+    } else {
+        ALOGI("Disconnected from VIS...");
+    }
+}
+
+void Sensors::onVisConnectionStatusUpdate(bool connected) {
+    ALOGI("onVisConnectionStatusUpdate: Received connection state update to %d from VisClient",
+          connected);
+    // Async c-back to reach out of VisClient main thread context
+    std::function<void(bool)> resultHandler =
+        std::bind(&Sensors::handleConnectionAsync, this, std::placeholders::_1);
+    mConnectionFuture = std::async(std::launch::async, resultHandler, connected);
+}
+
+/* General sensors related */
 
 Sensors::Sensors()
     : mInitCheck(NO_INIT),
-      mSensorModule(nullptr),
-      mSensorDevice(nullptr) {
-    status_t err = OK;
-    if (UseMultiHal()) {
-        mSensorModule = ::get_multi_hal_module_info();
+      mRecurrentTimer(std::bind(&Sensors::onContinuousPropertyTimer, this, std::placeholders::_1)) {
+    ALOGD("Init");
+    mActiveSensors = 0;
+    if (SensorsFactory::buildSensorsFromConfig(mSensorList, mVisToSensorHandle,
+                                               sensorHandleToVis)) {
+        mInitCheck = OK;
+        ALOGD("Parced sensor config...");
+        mOperationMode = OperationMode::NORMAL;
+        std::function<void(bool)> connHandler =
+            std::bind(&Sensors::onVisConnectionStatusUpdate, this, std::placeholders::_1);
+        mVisClient.registerServerConnectionhandler(connHandler);
+        mVisClient.start();
+        ALOGD("Started VIS client...");
     } else {
-        err = hw_get_module(
-            SENSORS_HARDWARE_MODULE_ID,
-            (hw_module_t const **)&mSensorModule);
+        mInitCheck = UNKNOWN_ERROR;
+        ALOGE("Failed to build sensors from config....");
     }
-    if (mSensorModule == NULL) {
-        err = UNKNOWN_ERROR;
-    }
-
-    if (err != OK) {
-        LOG(ERROR) << "Couldn't load "
-                   << SENSORS_HARDWARE_MODULE_ID
-                   << " module ("
-                   << strerror(-err)
-                   << ")";
-
-        mInitCheck = err;
-        return;
-    }
-
-    err = sensors_open_1(&mSensorModule->common, &mSensorDevice);
-
-    if (err != OK) {
-        LOG(ERROR) << "Couldn't open device for module "
-                   << SENSORS_HARDWARE_MODULE_ID
-                   << " ("
-                   << strerror(-err)
-                   << ")";
-
-        mInitCheck = err;
-        return;
-    }
-
-    // Require all the old HAL APIs to be present except for injection, which
-    // is considered optional.
-    CHECK_GE(getHalDeviceVersion(), SENSORS_DEVICE_API_VERSION_1_3);
-
-    if (getHalDeviceVersion() == SENSORS_DEVICE_API_VERSION_1_4) {
-        if (mSensorDevice->inject_sensor_data == nullptr) {
-            LOG(ERROR) << "HAL specifies version 1.4, but does not implement inject_sensor_data()";
-        }
-        if (mSensorModule->set_operation_mode == nullptr) {
-            LOG(ERROR) << "HAL specifies version 1.4, but does not implement set_operation_mode()";
-        }
-    }
-
-    mInitCheck = OK;
+    // TODO(Andrii): Add static configuration
 }
 
-status_t Sensors::initCheck() const {
-    return mInitCheck;
+Sensors::~Sensors() { mVisClient.stop(); }
+
+void Sensors::insertEventUnlocked(Event& ev) {
+    mEventQueue.push(ev);
+    if (mEventQueue.size() > kMaxEventQueueSize) {
+        mEventQueue.pop();
+        ALOGE("Event queue overflow, dropped oldest event");
+    }
 }
+
+void Sensors::onContinuousPropertyTimer(const std::vector<int32_t>& properties) {
+    for (int32_t property : properties) {
+        if (isContiniousSensor(mSensorList[property].si.type)) {
+            std::lock_guard<std::mutex> lock(mPollLock);
+            Event ev;
+#ifdef GENERATE_FAKE_EVENTS
+            ev = createFakeEvent(property);
+#else
+            ev = {
+                .sensorHandle = property,
+                .sensorType = reinterpret_cast<SensorType>(mSensorList[property].si.type),
+                .timestamp = elapsedRealtimeNano(),
+                .u = mSensorList[property].eventPayload,
+            };
+#endif
+            insertEventUnlocked(ev);
+            ALOGV("Recurrent event for sensor handle %d", property);
+        } else {
+            ALOGE("Unexpected onContinuousPropertyTimer for property: 0x%x", property);
+        }
+    }
+}
+
+status_t Sensors::initCheck() const { return mInitCheck; }
+
+/*
+union EventPayload final {
+    ::android::hardware::sensors::V1_0::Vec3 vec3 __attribute__ ((aligned(4)));
+    ::android::hardware::sensors::V1_0::Vec4 vec4 __attribute__ ((aligned(4)));
+    ::android::hardware::sensors::V1_0::Uncal uncal __attribute__ ((aligned(4)));
+    ::android::hardware::sensors::V1_0::MetaData meta __attribute__ ((aligned(4)));
+    float scalar __attribute__ ((aligned(4)));
+    uint64_t stepCount __attribute__ ((aligned(8)));
+    ::android::hardware::sensors::V1_0::HeartRate heartRate __attribute__ ((aligned(4)));
+    ::android::hardware::hidl_array<float, 15> pose6DOF __attribute__ ((aligned(4)));
+    ::android::hardware::sensors::V1_0::DynamicSensorInfo dynamic __attribute__ ((aligned(4)));
+    ::android::hardware::sensors::V1_0::AdditionalInfo additional __attribute__ ((aligned(4)));
+    ::android::hardware::hidl_array<float, 16> data __attribute__ ((aligned(4)));
+};
+*/
+
+Event Sensors::createFakeEvent(int32_t sensor_handle) {
+    static float delta = 0.1;
+    Event ev = {
+        .sensorHandle = sensor_handle,
+        .sensorType = (SensorType)mSensorList[sensor_handle].si.type,
+        .timestamp = elapsedRealtimeNano(),
+    };
+
+    switch (ev.sensorType) {
+            /*
+            struct Vec3 final {
+            float x __attribute__ ((aligned(4)));
+            float y __attribute__ ((aligned(4)));
+            float z __attribute__ ((aligned(4)));
+            ::android::hardware::sensors::V1_0::SensorStatus status __attribute__ ((aligned(1)));
+            };
+            */
+        case SensorType::ACCELEROMETER:
+        case SensorType::MAGNETIC_FIELD:
+        case SensorType::ORIENTATION:
+        case SensorType::GYROSCOPE:
+        case SensorType::GRAVITY:
+        case SensorType::LINEAR_ACCELERATION: {
+            ev.u.vec3.x = 0.3 + delta;
+            ev.u.vec3.y = 0.2;
+            ev.u.vec3.z = 0.1 - delta;
+            ev.u.vec3.status = SensorStatus::ACCURACY_HIGH;
+            delta = delta * 2;
+            if (delta > 0.8) delta = 0.1;
+            break;
+        }
+
+            /*
+            struct Vec4 final {
+                float x __attribute__ ((aligned(4)));
+                float y __attribute__ ((aligned(4)));
+                float z __attribute__ ((aligned(4)));
+                float w __attribute__ ((aligned(4)));
+            };
+            */
+        case SensorType::GAME_ROTATION_VECTOR: {
+            ev.u.vec4.x = 1;
+            ev.u.vec4.y = 2;
+            ev.u.vec4.z = 3;
+            ev.u.vec4.w = 4;
+            break;
+        }
+            /*
+            ::android::hardware::hidl_array<float, 16> data __attribute__ ((aligned(4)));
+            */
+        case SensorType::ROTATION_VECTOR:
+        case SensorType::GEOMAGNETIC_ROTATION_VECTOR: {
+            ev.u.data[0] = 0;
+            ev.u.data[1] = 1;
+            ev.u.data[2] = 2;
+            ev.u.data[3] = 3;
+            ev.u.data[4] = 4;
+            break;
+        }
+            /*
+            struct Uncal final {
+                float x __attribute__ ((aligned(4)));
+                float y __attribute__ ((aligned(4)));
+                float z __attribute__ ((aligned(4)));
+                float x_bias __attribute__ ((aligned(4)));
+                float y_bias __attribute__ ((aligned(4)));
+                float z_bias __attribute__ ((aligned(4)));
+            };
+            */
+        case SensorType::MAGNETIC_FIELD_UNCALIBRATED:
+        case SensorType::GYROSCOPE_UNCALIBRATED:
+        case SensorType::ACCELEROMETER_UNCALIBRATED: {
+            ev.u.uncal.x = 0.1;
+            ev.u.uncal.y = 0.2;
+            ev.u.uncal.z = 0.3;
+            ev.u.uncal.x_bias = 0.3;
+            ev.u.uncal.y_bias = 0.2;
+            ev.u.uncal.z_bias = 0.1;
+            break;
+        }
+
+            /*
+            float scalar __attribute__ ((aligned(4)));
+            */
+        case SensorType::DEVICE_ORIENTATION:
+        case SensorType::LIGHT:
+        case SensorType::PRESSURE:
+        case SensorType::TEMPERATURE:
+        case SensorType::PROXIMITY:
+        case SensorType::RELATIVE_HUMIDITY:
+        case SensorType::AMBIENT_TEMPERATURE:
+        case SensorType::SIGNIFICANT_MOTION:
+        case SensorType::STEP_DETECTOR:
+        case SensorType::TILT_DETECTOR:
+        case SensorType::WAKE_GESTURE:
+        case SensorType::GLANCE_GESTURE:
+        case SensorType::PICK_UP_GESTURE:
+        case SensorType::WRIST_TILT_GESTURE:
+        case SensorType::STATIONARY_DETECT:
+        case SensorType::MOTION_DETECT:
+        case SensorType::HEART_BEAT:
+        case SensorType::LOW_LATENCY_OFFBODY_DETECT: {
+            ev.u.scalar = 3.4;
+            break;
+        }
+
+            /*
+            uint64_t stepCount __attribute__ ((aligned(8)));
+            */
+        case SensorType::STEP_COUNTER: {
+            ev.u.stepCount = 1024;
+            break;
+        }
+            /*
+            struct HeartRate final {
+                float bpm __attribute__ ((aligned(4)));
+                ::android::hardware::sensors::V1_0::SensorStatus status __attribute__
+            ((aligned(1)));
+            };
+            */
+        case SensorType::HEART_RATE: {
+            ev.u.heartRate.bpm = 1024.6;
+            ev.u.heartRate.status = SensorStatus::ACCURACY_HIGH;
+            break;
+        }
+
+        case SensorType::POSE_6DOF: {  // 15 floats
+            for (size_t i = 0; i < 15; ++i) {
+                ev.u.pose6DOF[i] = 14.4;
+            }
+            break;
+        }
+        default:
+            ALOGE("Can't create fake event");
+    }
+    return ev;
+}
+
+/* Public Sensors HAL API */
 
 Return<void> Sensors::getSensorsList(getSensorsList_cb _hidl_cb) {
-    sensor_t const *list;
-    size_t count = mSensorModule->get_sensors_list(mSensorModule, &list);
-
+    ALOGD("getSensorsList");
     hidl_vec<SensorInfo> out;
-    out.resize(count);
 
-    for (size_t i = 0; i < count; ++i) {
-        const sensor_t *src = &list[i];
-        SensorInfo *dst = &out[i];
+    {
+        std::lock_guard<std::mutex> lock(mLock);
+        size_t count = mSensorList.size();
+        out.resize(count);
 
-        convertFromSensor(*src, dst);
+        for (size_t i = 0; i < count; ++i) {
+            out[i] = mSensorList[i].si;
+        }
     }
 
     _hidl_cb(out);
-
     return Void();
 }
 
-int Sensors::getHalDeviceVersion() const {
-    if (!mSensorDevice) {
-        return -1;
-    }
-
-    return mSensorDevice->common.version;
-}
-
 Return<Result> Sensors::setOperationMode(OperationMode mode) {
-    if (getHalDeviceVersion() < SENSORS_DEVICE_API_VERSION_1_4
-            || mSensorModule->set_operation_mode == nullptr) {
-        return Result::INVALID_OPERATION;
-    }
-    return ResultFromStatus(mSensorModule->set_operation_mode((uint32_t)mode));
+    ALOGD("setOperationMode mode=%d", static_cast<int32_t>(mode));
+    std::lock_guard<std::mutex> lock(mLock);
+    if (mode == OperationMode::DATA_INJECTION) return Result::BAD_VALUE;
+    mOperationMode = mode;
+    return Result::OK;
 }
 
-Return<Result> Sensors::activate(
-        int32_t sensor_handle, bool enabled) {
-    return ResultFromStatus(
-            mSensorDevice->activate(
-                reinterpret_cast<sensors_poll_device_t *>(mSensorDevice),
-                sensor_handle,
-                enabled));
+Return<Result> Sensors::activate(int32_t sensor_handle, bool enabled) {
+    ALOGV("activate sensor_handle=%d enabled=%d", sensor_handle, enabled);
+    std::lock_guard<std::mutex> lock(mLock);
+    if (mSensorList[sensor_handle].enabled != enabled) {
+        enabled ? ++mActiveSensors : --mActiveSensors;
+        mSensorList[sensor_handle].enabled = enabled;
+        if (isRecurrentEventNeeded(mSensorList[sensor_handle].si.type) &&
+            mSensorList[sensor_handle].samplingPeriodNs != 0) {
+            if (mSensorList[sensor_handle].enabled) {
+                std::chrono::duration<long, std::nano> ns{
+                    mSensorList[sensor_handle].samplingPeriodNs};
+                mRecurrentTimer.registerRecurrentEvent(ns, sensor_handle);
+            } else {
+                mRecurrentTimer.unregisterRecurrentEvent(sensor_handle);
+            }
+        }
+    }
+    return Result::OK;
 }
 
 Return<void> Sensors::poll(int32_t maxCount, poll_cb _hidl_cb) {
-
+    ALOGV("poll maxCount=%d", maxCount);
     hidl_vec<Event> out;
     hidl_vec<SensorInfo> dynamicSensorsAdded;
 
-    std::unique_ptr<sensors_event_t[]> data;
-    int err = android::NO_ERROR;
+    int cnt = 0;
+    size_t eventCnt = maxCount;
 
-    { // scope of reentry lock
-
-        // This enforces a single client, meaning that a maximum of one client can call poll().
-        // If this function is re-entred, it means that we are stuck in a state that may prevent
-        // the system from proceeding normally.
-        //
-        // Exit and let the system restart the sensor-hal-implementation hidl service.
-        //
-        // This function must not call _hidl_cb(...) or return until there is no risk of blocking.
-        std::unique_lock<std::mutex> lock(mPollLock, std::try_to_lock);
-        if(!lock.owns_lock()){
-            // cannot get the lock, hidl service will go into deadlock if it is not restarted.
-            // This is guaranteed to not trigger in passthrough mode.
-            LOG(ERROR) <<
-                    "ISensors::poll() re-entry. I do not know what to do except killing myself.";
-            ::exit(-1);
+    while (1) {
+        {
+            std::lock_guard<std::mutex> lock(mPollLock);
+            if ((mEventQueue.size() > 0) || (mActiveSensors == 0)) break;
         }
-
-        if (maxCount <= 0) {
-            err = android::BAD_VALUE;
-        } else {
-            int bufferSize = maxCount <= kPollMaxBufferSize ? maxCount : kPollMaxBufferSize;
-            data.reset(new sensors_event_t[bufferSize]);
-            err = mSensorDevice->poll(
-                    reinterpret_cast<sensors_poll_device_t *>(mSensorDevice),
-                    data.get(), bufferSize);
+        // TODO(Andrii) recalculate using max_report_latency_ns
+        usleep(100000);
+        if (cnt++ > 30) {
+            ALOGV("Poll timeout ......");
+            break;
         }
     }
 
-    if (err < 0) {
-        _hidl_cb(ResultFromStatus(err), out, dynamicSensorsAdded);
-        return Void();
-    }
-
-    const size_t count = (size_t)err;
-
-    for (size_t i = 0; i < count; ++i) {
-        if (data[i].type != SENSOR_TYPE_DYNAMIC_SENSOR_META) {
-            continue;
+    {
+        std::lock_guard<std::mutex> lock(mPollLock);
+        if (eventCnt > mEventQueue.size()) eventCnt = mEventQueue.size();
+        out.resize(eventCnt);
+        for (size_t i = 0; i < eventCnt; i++) {
+            out[i] = mEventQueue.front();
+            mEventQueue.pop();
         }
-
-        const dynamic_sensor_meta_event_t *dyn = &data[i].dynamic_sensor_meta;
-
-        if (!dyn->connected) {
-            continue;
-        }
-
-        CHECK(dyn->sensor != nullptr);
-        CHECK_EQ(dyn->sensor->handle, dyn->handle);
-
-        SensorInfo info;
-        convertFromSensor(*dyn->sensor, &info);
-
-        size_t numDynamicSensors = dynamicSensorsAdded.size();
-        dynamicSensorsAdded.resize(numDynamicSensors + 1);
-        dynamicSensorsAdded[numDynamicSensors] = info;
     }
-
-    out.resize(count);
-    convertFromSensorEvents(err, data.get(), &out);
-
+    ALOGV("Will send %zu events", out.size());
     _hidl_cb(Result::OK, out, dynamicSensorsAdded);
 
     return Void();
 }
 
-Return<Result> Sensors::batch(
-        int32_t sensor_handle,
-        int64_t sampling_period_ns,
-        int64_t max_report_latency_ns) {
-    return ResultFromStatus(
-            mSensorDevice->batch(
-                mSensorDevice,
-                sensor_handle,
-                0, /*flags*/
-                sampling_period_ns,
-                max_report_latency_ns));
+Return<Result> Sensors::batch(int32_t sensor_handle, int64_t sampling_period_ns,
+                              int64_t max_report_latency_ns) {
+    ALOGD("batch sensor_handle=%d sampling_period_ns=%ld max_report_latency_ns=%ld", sensor_handle,
+          sampling_period_ns, max_report_latency_ns);
+    std::lock_guard<std::mutex> lock(mLock);
+    if (isRecurrentEventNeeded(mSensorList[sensor_handle].si.type)) {
+        if (mSensorList[sensor_handle].enabled) {
+            if (mSensorList[sensor_handle].samplingPeriodNs != 0) {
+                mRecurrentTimer.unregisterRecurrentEvent(sensor_handle);
+            }
+            std::chrono::duration<long, std::nano> ns{sampling_period_ns};
+            mRecurrentTimer.registerRecurrentEvent(ns, sensor_handle);
+        }
+        mSensorList[sensor_handle].samplingPeriodNs = sampling_period_ns;
+        mSensorList[sensor_handle].maxReportLatencyNs = max_report_latency_ns;
+        ALOGD("Sensor[%d] sampling_period_ns=%ld max_report_latency_ns=%ld were updated",
+              sensor_handle, sampling_period_ns, max_report_latency_ns);
+        return Result::OK;
+    }
+
+    return Result::INVALID_OPERATION;
 }
 
 Return<Result> Sensors::flush(int32_t sensor_handle) {
-    return ResultFromStatus(mSensorDevice->flush(mSensorDevice, sensor_handle));
+    ALOGD("flush sensor_handle=%d", sensor_handle);
+    std::lock_guard<std::mutex> lock(mPollLock);
+    Event ev = {
+        .sensorHandle = sensor_handle,
+        .sensorType = SensorType::META_DATA,
+        .timestamp = 0ll,
+    };
+    ev.u.meta.what = MetaDataEventType::META_DATA_FLUSH_COMPLETE;
+    insertEventUnlocked(ev);
+    return Result::OK;
 }
 
-Return<Result> Sensors::injectSensorData(const Event& event) {
-    if (getHalDeviceVersion() < SENSORS_DEVICE_API_VERSION_1_4
-            || mSensorDevice->inject_sensor_data == nullptr) {
-        return Result::INVALID_OPERATION;
-    }
-
-    sensors_event_t out;
-    convertToSensorEvent(event, &out);
-
-    return ResultFromStatus(
-            mSensorDevice->inject_sensor_data(mSensorDevice, &out));
+Return<Result> Sensors::injectSensorData(const Event& /*event*/) {
+    ALOGD("injectSensorData");
+    // HAL does not support
+    return Result::INVALID_OPERATION;
 }
 
-Return<void> Sensors::registerDirectChannel(
-        const SharedMemInfo& mem, registerDirectChannel_cb _hidl_cb) {
-    if (mSensorDevice->register_direct_channel == nullptr
-            || mSensorDevice->config_direct_report == nullptr) {
-        // HAL does not support
-        _hidl_cb(Result::INVALID_OPERATION, -1);
-        return Void();
-    }
-
-    sensors_direct_mem_t m;
-    if (!convertFromSharedMemInfo(mem, &m)) {
-      _hidl_cb(Result::BAD_VALUE, -1);
-      return Void();
-    }
-
-    int err = mSensorDevice->register_direct_channel(mSensorDevice, &m, -1);
-
-    if (err < 0) {
-        _hidl_cb(ResultFromStatus(err), -1);
-    } else {
-        int32_t channelHandle = static_cast<int32_t>(err);
-        _hidl_cb(Result::OK, channelHandle);
-    }
+Return<void> Sensors::registerDirectChannel(const SharedMemInfo& /*mem*/,
+                                            registerDirectChannel_cb _hidl_cb) {
+    ALOGD("registerDirectChannel");
+    // HAL does not support
+    _hidl_cb(Result::INVALID_OPERATION, -1);
     return Void();
 }
 
 Return<Result> Sensors::unregisterDirectChannel(int32_t channelHandle) {
-    if (mSensorDevice->register_direct_channel == nullptr
-            || mSensorDevice->config_direct_report == nullptr) {
-        // HAL does not support
-        return Result::INVALID_OPERATION;
-    }
-
-    mSensorDevice->register_direct_channel(mSensorDevice, nullptr, channelHandle);
-
-    return Result::OK;
+    ALOGD("unregisterDirectChannel %d", channelHandle);
+    // HAL does not support
+    return Result::INVALID_OPERATION;
 }
 
-Return<void> Sensors::configDirectReport(
-        int32_t sensorHandle, int32_t channelHandle, RateLevel rate,
-        configDirectReport_cb _hidl_cb) {
-    if (mSensorDevice->register_direct_channel == nullptr
-            || mSensorDevice->config_direct_report == nullptr) {
-        // HAL does not support
-        _hidl_cb(Result::INVALID_OPERATION, -1);
-        return Void();
-    }
-
-    sensors_direct_cfg_t cfg = {
-        .rate_level = convertFromRateLevel(rate)
-    };
-    if (cfg.rate_level < 0) {
-        _hidl_cb(Result::BAD_VALUE, -1);
-        return Void();
-    }
-
-    int err = mSensorDevice->config_direct_report(mSensorDevice,
-            sensorHandle, channelHandle, &cfg);
-
-    if (rate == RateLevel::STOP) {
-        _hidl_cb(ResultFromStatus(err), -1);
-    } else {
-        _hidl_cb(err > 0 ? Result::OK : ResultFromStatus(err), err);
-    }
+Return<void> Sensors::configDirectReport(int32_t /*sensorHandle*/, int32_t /*channelHandle*/,
+                                         RateLevel /*rate*/, configDirectReport_cb _hidl_cb) {
+    // HAL does not support
+    _hidl_cb(Result::INVALID_OPERATION, -1);
     return Void();
 }
 
-// static
-void Sensors::convertFromSensorEvents(
-        size_t count,
-        const sensors_event_t *srcArray,
-        hidl_vec<Event> *dstVec) {
-    for (size_t i = 0; i < count; ++i) {
-        const sensors_event_t &src = srcArray[i];
-        Event *dst = &(*dstVec)[i];
-
-        convertFromSensorEvent(src, dst);
+bool Sensors::isOneShotSensor(SensorType sType) const {
+    switch (sType) {
+        case SensorType::SIGNIFICANT_MOTION:
+        case SensorType::WAKE_GESTURE:
+        case SensorType::GLANCE_GESTURE:
+        case SensorType::DEVICE_ORIENTATION:
+        case SensorType::STATIONARY_DETECT:
+        case SensorType::MOTION_DETECT:
+            return true;
+        default:
+            return false;
     }
+    return false;
 }
 
-ISensors *HIDL_FETCH_ISensors(const char * /* hal */) {
-    Sensors *sensors = new Sensors;
+bool Sensors::isContiniousSensor(SensorType sType) const {
+    switch (sType) {
+        case SensorType::ACCELEROMETER:
+        case SensorType::MAGNETIC_FIELD:
+        case SensorType::ORIENTATION:
+        case SensorType::GYROSCOPE:
+        case SensorType::PRESSURE:
+        case SensorType::GRAVITY:
+        case SensorType::LINEAR_ACCELERATION:
+        case SensorType::ROTATION_VECTOR:
+        case SensorType::MAGNETIC_FIELD_UNCALIBRATED:
+        case SensorType::GAME_ROTATION_VECTOR:
+        case SensorType::GYROSCOPE_UNCALIBRATED:
+        case SensorType::GEOMAGNETIC_ROTATION_VECTOR:
+        case SensorType::POSE_6DOF:
+        case SensorType::HEART_BEAT:
+        case SensorType::ACCELEROMETER_UNCALIBRATED:
+            return true;
+        default:
+            return false;
+    }
+    return false;
+}
+
+bool Sensors::isOnChangeSensor(SensorType sType) const {
+    switch (sType) {
+        case SensorType::LIGHT:
+        case SensorType::PROXIMITY:
+        case SensorType::RELATIVE_HUMIDITY:
+        case SensorType::AMBIENT_TEMPERATURE:
+        case SensorType::STEP_COUNTER:
+        case SensorType::HEART_RATE:
+        case SensorType::DEVICE_ORIENTATION:
+        case SensorType::LOW_LATENCY_OFFBODY_DETECT:
+            return true;
+        default:
+            return false;
+    }
+    return false;
+}
+
+// static
+
+ISensors* HIDL_FETCH_ISensors(const char* /* hal */) {
+    Sensors* sensors = new Sensors;
     if (sensors->initCheck() != OK) {
         delete sensors;
         sensors = nullptr;
@@ -353,7 +681,7 @@ ISensors *HIDL_FETCH_ISensors(const char * /* hal */) {
     return sensors;
 }
 
-}  // namespace implementation
+}  // namespace xenvm
 }  // namespace V1_0
 }  // namespace sensors
 }  // namespace hardware
