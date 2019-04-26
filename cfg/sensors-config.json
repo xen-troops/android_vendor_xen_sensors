@@ -1,0 +1,17 @@
+[
+{
+    "sensor-name": "acc1",
+    "sensor-vendor": "vis based",
+    "version":1,
+    "sensor-type":1,
+    "sensor-type-string":"android.sensor.accelerometer",
+    "max-range":19.62,
+    "resolution":0.01,
+    "power":1,
+    "min-delay":100000,
+    "max-delay":1000000,
+    "permission":"",
+    "flags":0,
+    "vis-property": "Test.Vehicle.acc1"
+}
+]
