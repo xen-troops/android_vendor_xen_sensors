@@ -32,7 +32,12 @@ using ::android::sp;
 
 int main(int /* argc */, char* /* argv */ []) {
     sp<ISensors> service = new Sensors();
-    configureRpcThreadpool(1, true /* will join */);
+    /* Sensors framework service needs at least two threads.
+     * One thread blocks on a "poll"
+     * The second thread is needed for all other HAL methods.
+     * During VTS test we found that 4 is the most suitable thread count.
+     */
+    configureRpcThreadpool(4, true /* will join */);
     if (service->registerAsService() != OK) {
         ALOGE("Could not register sensors.xenvm 1.0 service.");
         return 1;
