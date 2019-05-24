@@ -87,6 +87,8 @@ struct Sensors : public ::android::hardware::sensors::V1_0::ISensors {
     static constexpr int32_t kPollMaxBufferSize = 128;
     status_t mInitCheck;
     std::mutex mPollLock;
+
+    std::mutex mEventLock;
     std::queue<Event> mEventQueue;
     std::vector<ExtendedSensorInfo> mSensorList;
     std::map<std::string, int32_t> mVisToSensorHandle;
@@ -94,6 +96,8 @@ struct Sensors : public ::android::hardware::sensors::V1_0::ISensors {
     OperationMode mOperationMode;
     std::mutex mLock;
     RecurrentTimer mRecurrentTimer;
+    std::mutex mPollConditionLock;
+    std::condition_variable mPollCondition;
 
     VisClient mVisClient;
     bool mVisConnceted;

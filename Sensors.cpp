@@ -26,6 +26,8 @@
 #include <sys/stat.h>
 #include <utils/SystemClock.h>
 
+#include <algorithm>
+
 namespace android {
 namespace hardware {
 namespace sensors {
@@ -60,7 +62,7 @@ void Sensors::subscriptionHandler(const epam::CommandResult& result) {
                   sit->second);
             if (convertJsonToSensorPayload(sit->second, r.second)) {
                 if (!isContiniousSensor(mSensorList[sit->second].si.type)) {
-                    std::lock_guard<std::mutex> lock(mPollLock);
+                    std::lock_guard<std::mutex> lock(mEventLock);
                     Event ev = {
                         .sensorHandle = sit->second,
                         .sensorType =
@@ -283,12 +285,14 @@ void Sensors::insertEventUnlocked(Event& ev) {
         mEventQueue.pop();
         ALOGE("Event queue overflow, dropped oldest event");
     }
+    mPollCondition.notify_all();
+    ALOGV("notified all about event...");
 }
 
 void Sensors::onContinuousPropertyTimer(const std::vector<int32_t>& properties) {
     for (int32_t property : properties) {
         if (isContiniousSensor(mSensorList[property].si.type)) {
-            std::lock_guard<std::mutex> lock(mPollLock);
+            std::lock_guard<std::mutex> lock(mEventLock);
             Event ev;
 #ifdef GENERATE_FAKE_EVENTS
             ev = createFakeEvent(property);
@@ -349,9 +353,9 @@ Event Sensors::createFakeEvent(int32_t sensor_handle) {
         case SensorType::GYROSCOPE:
         case SensorType::GRAVITY:
         case SensorType::LINEAR_ACCELERATION: {
-            ev.u.vec3.x = 0.3 + delta;
-            ev.u.vec3.y = 0.2;
-            ev.u.vec3.z = 0.1 - delta;
+            ev.u.vec3.x = 6.3 + delta;
+            ev.u.vec3.y = 6.2;
+            ev.u.vec3.z = 6.1 - delta;
             ev.u.vec3.status = SensorStatus::ACCURACY_HIGH;
             delta = delta * 2;
             if (delta > 0.8) delta = 0.1;
@@ -501,10 +505,10 @@ Return<Result> Sensors::activate(int32_t sensor_handle, bool enabled) {
         if (isRecurrentEventNeeded(mSensorList[sensor_handle].si.type) &&
             mSensorList[sensor_handle].samplingPeriodNs != 0) {
             if (mSensorList[sensor_handle].enabled) {
-                std::chrono::duration<long, std::nano> ns{
-                    mSensorList[sensor_handle].samplingPeriodNs};
-                mRecurrentTimer.registerRecurrentEvent(ns, sensor_handle);
+                ALOGV("Scheduled reccurent event using =%lu",mSensorList[sensor_handle].samplingPeriodNs);
+                mRecurrentTimer.registerRecurrentEvent(std::chrono::nanoseconds{mSensorList[sensor_handle].samplingPeriodNs}, sensor_handle);
             } else {
+                ALOGV(" Unregister reccurent event for sensor handle %d", sensor_handle);
                 mRecurrentTimer.unregisterRecurrentEvent(sensor_handle);
             }
         }
@@ -517,53 +521,55 @@ Return<void> Sensors::poll(int32_t maxCount, poll_cb _hidl_cb) {
     hidl_vec<Event> out;
     hidl_vec<SensorInfo> dynamicSensorsAdded;
 
-    int cnt = 0;
+
+    if (!maxCount) {
+        _hidl_cb(Result::OK, out, dynamicSensorsAdded);
+        ALOGV("Sent events %zu dyn sensors added %zu", out.size(), dynamicSensorsAdded.size());
+        return Void();
+    }
+
+    std::unique_lock<std::mutex> lock(mPollLock);
     size_t eventCnt = maxCount;
 
     while (1) {
+        std::unique_lock<std::mutex> ulock(mPollConditionLock);
         {
-            std::lock_guard<std::mutex> lock(mPollLock);
-            if ((mEventQueue.size() > 0) || (mActiveSensors == 0)) break;
+            std::unique_lock<std::mutex> elock(mEventLock);
+            if ((mEventQueue.size() > 0)) {
+                if (eventCnt >= mEventQueue.size()) eventCnt = mEventQueue.size();
+                out.resize(eventCnt);
+                for (size_t i = 0; i < eventCnt; i++) {
+                    out[i] = mEventQueue.front();
+                    mEventQueue.pop();
+                }
+                break;
+            }
         }
-        // TODO(Andrii) recalculate using max_report_latency_ns
-        usleep(100000);
-        if (cnt++ > 30) {
-            ALOGV("Poll timeout ......");
-            break;
-        }
+        mPollCondition.wait_for(ulock, std::chrono::milliseconds(500));
+        ALOGV("got notify about events...");
     }
-
-    {
-        std::lock_guard<std::mutex> lock(mPollLock);
-        if (eventCnt > mEventQueue.size()) eventCnt = mEventQueue.size();
-        out.resize(eventCnt);
-        for (size_t i = 0; i < eventCnt; i++) {
-            out[i] = mEventQueue.front();
-            mEventQueue.pop();
-        }
-    }
-    ALOGV("Will send %zu events", out.size());
     _hidl_cb(Result::OK, out, dynamicSensorsAdded);
-
+    ALOGV("Sent events %zu dyn sensors added %zu", out.size(), dynamicSensorsAdded.size());
     return Void();
 }
 
 Return<Result> Sensors::batch(int32_t sensor_handle, int64_t sampling_period_ns,
                               int64_t max_report_latency_ns) {
-    ALOGD("batch sensor_handle=%d sampling_period_ns=%ld max_report_latency_ns=%ld", sensor_handle,
+    ALOGV("batch sensor_handle=%d sampling_period_ns=%ld max_report_latency_ns=%ld", sensor_handle,
           sampling_period_ns, max_report_latency_ns);
     std::lock_guard<std::mutex> lock(mLock);
     if (isRecurrentEventNeeded(mSensorList[sensor_handle].si.type)) {
         if (mSensorList[sensor_handle].enabled) {
             if (mSensorList[sensor_handle].samplingPeriodNs != 0) {
+                ALOGV("Unregister reccurent event for sensor handle %d", sensor_handle);
                 mRecurrentTimer.unregisterRecurrentEvent(sensor_handle);
             }
-            std::chrono::duration<long, std::nano> ns{sampling_period_ns};
-            mRecurrentTimer.registerRecurrentEvent(ns, sensor_handle);
+            ALOGV("Scheduled reccurent event using =%lu for sensor handle %d",mSensorList[sensor_handle].samplingPeriodNs, sensor_handle);
+            mRecurrentTimer.registerRecurrentEvent(std::chrono::nanoseconds{sampling_period_ns}, sensor_handle);
         }
         mSensorList[sensor_handle].samplingPeriodNs = sampling_period_ns;
         mSensorList[sensor_handle].maxReportLatencyNs = max_report_latency_ns;
-        ALOGD("Sensor[%d] sampling_period_ns=%ld max_report_latency_ns=%ld were updated",
+        ALOGV("Sensor[%d] sampling_period_ns=%ld max_report_latency_ns=%ld were updated",
               sensor_handle, sampling_period_ns, max_report_latency_ns);
         return Result::OK;
     }
@@ -572,8 +578,8 @@ Return<Result> Sensors::batch(int32_t sensor_handle, int64_t sampling_period_ns,
 }
 
 Return<Result> Sensors::flush(int32_t sensor_handle) {
-    ALOGD("flush sensor_handle=%d", sensor_handle);
-    std::lock_guard<std::mutex> lock(mPollLock);
+    ALOGV("flush sensor_handle=%d", sensor_handle);
+    std::lock_guard<std::mutex> lock(mEventLock);
     Event ev = {
         .sensorHandle = sensor_handle,
         .sensorType = SensorType::META_DATA,
@@ -585,21 +591,21 @@ Return<Result> Sensors::flush(int32_t sensor_handle) {
 }
 
 Return<Result> Sensors::injectSensorData(const Event& /*event*/) {
-    ALOGD("injectSensorData");
+    ALOGV("injectSensorData");
     // HAL does not support
     return Result::INVALID_OPERATION;
 }
 
 Return<void> Sensors::registerDirectChannel(const SharedMemInfo& /*mem*/,
                                             registerDirectChannel_cb _hidl_cb) {
-    ALOGD("registerDirectChannel");
+    ALOGV("registerDirectChannel");
     // HAL does not support
     _hidl_cb(Result::INVALID_OPERATION, -1);
     return Void();
 }
 
 Return<Result> Sensors::unregisterDirectChannel(int32_t channelHandle) {
-    ALOGD("unregisterDirectChannel %d", channelHandle);
+    ALOGV("unregisterDirectChannel %d", channelHandle);
     // HAL does not support
     return Result::INVALID_OPERATION;
 }
