@@ -350,7 +350,6 @@ Event Sensors::createFakeEvent(int32_t sensor_handle) {
         case SensorType::ACCELEROMETER:
         case SensorType::MAGNETIC_FIELD:
         case SensorType::ORIENTATION:
-        case SensorType::GYROSCOPE:
         case SensorType::GRAVITY:
         case SensorType::LINEAR_ACCELERATION: {
             ev.u.vec3.x = 6.3 + delta;
@@ -359,6 +358,14 @@ Event Sensors::createFakeEvent(int32_t sensor_handle) {
             ev.u.vec3.status = SensorStatus::ACCURACY_HIGH;
             delta = delta * 2;
             if (delta > 0.8) delta = 0.1;
+            break;
+        }
+
+        case SensorType::GYROSCOPE: {
+            ev.u.vec3.x = 0.01;
+            ev.u.vec3.y = 0.01;
+            ev.u.vec3.z = 0.01;
+            ev.u.vec3.status = SensorStatus::ACCURACY_HIGH;
             break;
         }
 
